@@ -107,21 +107,83 @@ python3 -m energy_alloc 输入.json 输出.json
 ## 4. 目录结构
 
 ```
-energy_alloc/
-  errors.py       统一错误类型（path + message）
-  validation.py   JSON 语法/结构/类型/标识/权重/唯一性校验
-  graph.py        时间分段、无环与权重和校验、精确有理数积分 → A
-  rounding.py     自写最小费用流（消圈法）+ 字典序平局 → B
-  pipeline.py     端到端编排与原子写入
-  cli.py          命令行入口
-  __main__.py     支持 python -m energy_alloc
-run_allocation.py 启动脚本
+energy_alloc/        冻结分摊实现（校验/积分/取整/管线/CLI），保持不变
+settlement/          结算服务（SQLite 持久化 + HTTP 受理 + 投递进程）
+  core.py            信封校验、冻结实现复用、版本状态机、待投批次差分
+  store.py           SQLite：版本/回执/待投批次/在途租约/水位
+  http_server.py     POST /submit、GET /query、GET /health
+  delivery.py        独立投递进程（按序重试、租约、连续前缀水位）
+  cli.py             结算服务命令行
+ledger/              独立 HTTP 持久账本（独立 SQLite 文件）
+  store.py           版本幂等、顺序控制、(事实,终点) 余额整批累加
+  http_server.py     POST /ledger、GET /query、GET /health
+  cli.py             账本命令行
+run_settlement.py    结算服务启动脚本（支持 python3 -I）
+run_ledger.py        账本启动脚本（支持 python3 -I）
+run_delivery.py      投递进程启动脚本（支持 python3 -I）
 tests/
-  run_tests.py            测试统一入口
-  test_rounding_enum.py   取整小矩阵全枚举/随机枚举验收
-  test_pipeline.py        手算分摊、校验拒绝、原子写入与 CLI
-  data/                   手算用例与各类非法输入
+  test_settlement.py 受理/投递/账本/多进程/崩溃恢复/并发 验收
 ```
+
+## 4a. 能耗修订结算：受理、投递与持久账本
+
+冻结 CLI（第 2 节）完全保留；在此之上新增三个独立进程，全部纯标准库。
+
+### 4a.1 受理协议（结算服务 `POST /submit`）
+
+请求体顶层仅允许 `id` / `base` / `data`：
+
+* `id`：沿用原标识规则——非空 ASCII 字母数字串；
+* `base`：非负整数，布尔显式拒绝；
+* `data`：冻结实现的完整输入对象，按冻结规则校验，错误路径与冻结 CLI
+  完全一致（语法/重复键为 `$`，结构问题带零基下标如 `facts[0][2]`）。
+
+状态机（初态 `v=0 p=0 r=null`），所有判定在单条 `BEGIN IMMEDIATE`
+事务内完成，并发受理串行等价：
+
+| 情形 | 结果 |
+|---|---|
+| 同 `id` 同 JSON 结构 | 幂等回放原回执 `{"v": v}`，状态不变 |
+| 同 `id` 异内容 | `409`，拒绝不改状态 |
+| 新 `id` 且 `base != v` | `409`（路径 `$.base`） |
+| 新 `id` 且 `base == v` | `v += 1`，原子保存原结果、回执 `{"v":v}`、待投批次，200 `{"v":v}` |
+
+非法请求一律 `400`，体为 `{"path", "message"}`，拒绝不产生任何状态变更。
+`GET /query` 原子返回 `{"v", "p", "r"}`，`r` 为最新受理版的原结果
+（初态 `null`）。
+
+### 4a.2 待投批次与投递（投递进程 → 账本 `POST /ledger`）
+
+消息体 `{"v", "d"}`。`d` 按事实标识、终点标识双重对齐，取**新 B 减
+旧 B**：缺格作零，仅保留非零 `[事实id, 终点id, 整数差额]`，按两个标识
+的 ASCII 序（先事实后终点）排列；空批次保留为 `[]`，版本号不跳过。
+
+例：事实 `f` 直记终点 `X`，`n` 由 1 改 0，则 `d=[["f","X",-1]]`。
+
+投递进程只认领领先水位的下一版 `p+1`（SQLite 在途租约保证多进程不
+重复认领）；网络故障退避重试，通信恢复后自动追平。账本规则：
+
+* 同版同批：回原确认（幂等），余额不再变动；
+* 同版异批、越号（`v != 账本当前 v + 1`）：`409`，拒绝不改状态；
+* 合法批次在单事务内整批累加 `(事实,终点)` 余额并推进版本，
+  `synchronous=FULL` 提交即落盘，之后断连/强退安全，重放不重复记账。
+
+结算库仅在账本确认后重算**连续已确认前缀**推进水位 `p`，禁止跳号与
+重复记账。重启后从 SQLite 恢复待投批次、租约与水位，续投追平。
+
+### 4a.3 运行方式
+
+```bash
+mkdir -p var
+python3 -I run_ledger.py     --db var/ledger.db     --port 8081
+python3 -I run_settlement.py --db var/settlement.db --port 8080
+python3 -I run_delivery.py   --settlement-db var/settlement.db \
+    --ledger-url http://127.0.0.1:8081/ledger          # 守护模式
+```
+
+崩溃验收钩子：账本进程设置环境变量
+`LEDGER_CRASH_AFTER_COMMIT_VERSION=N` 后，版本 N 落盘后、响应前
+立即退出（退出码 27），模拟"远端落盘后、本地确认前强退"。
 
 ## 5. 验收测试
 
@@ -136,6 +198,10 @@ python3 -I tests/run_tests.py
 - `test_pipeline.py`：手算覆盖题面示例、换归属边界、多路径汇合、
   平行边、区间外生效边、跨时段伪环、起点即终点、零能耗、空事实、
   ASCII 排序，以及 16 类非法输入的路径报告、CLI 退出码和"失败保留旧文件"。
+- `test_settlement.py`：批次差分（对齐/缺格作零/只留非零/ASCII 序/
+  空批保留）、信封 400 路径与冻结错误透传、受理幂等与 409、`{v,p,r}`
+  查询、账本越号/异批拒绝、多线程并发受理串行等价、双投递进程不重复
+  记账，以及"账本落盘后强退 → 双服务重启 → 续投追平且余额只入一次"。
 
 ## 6. 手算速查（与 tests/data 对应）
 
