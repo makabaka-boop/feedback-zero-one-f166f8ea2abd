@@ -4,12 +4,15 @@
 ====
 * ``POST /submit``：受理 ``{id, base, data}``，成功 200 ``{"v": v}``；
   非法 400（带路径/零基下标，语法错 ``$``）；冲突 409；
+* ``POST /close``：结账，仅收 ``{id}``；先校验，同 id 回原回执
+  ``{"period","cut"}``，否则与提交串行等价地固定当前 ``v`` 为 ``cut``、
+  登记新期间；200 ``{"period","cut"}`` 表示受理，非法 400；
 * ``GET  /query``：原子返回 ``{"v", "p", "r"}``，
   ``r`` 为最新受理版的原结果（初态 ``null``）；
 * ``GET  /health``：存活探针。
 
 线程模型：:class:`ThreadingHTTPServer` 每请求一线程；持久层用单连接 +
-``BEGIN IMMEDIATE`` 串行化写事务，因此并发受理串行等价。
+``BEGIN IMMEDIATE`` 串行化写事务，因此并发受理/结账串行等价。
 """
 
 import json
@@ -19,7 +22,7 @@ from typing import Any
 
 from energy_alloc.errors import AllocationError
 
-from .core import accept
+from .core import accept, accept_close
 from .errors import ConflictError, EnvelopeError
 from .store import SettlementStore
 
@@ -55,25 +58,16 @@ def make_handler(store: SettlementStore) -> type:
             self._send(404, {"path": "$", "message": f"未知路径: {self.path}"})
 
         def do_POST(self) -> None:  # noqa: N802
+            if self.path == "/close":
+                self._post_close()
+                return
             if self.path != "/submit":
                 self._send(404, {"path": "$",
                                  "message": f"未知路径: {self.path}"})
                 return
-            length_raw = self.headers.get("Content-Length")
-            if length_raw is None:
-                self._send(400, {"path": "$",
-                                 "message": "缺少 Content-Length 请求头"})
+            body_text = self._read_body()
+            if body_text is None:
                 return
-            try:
-                length = int(length_raw)
-            except (TypeError, ValueError):
-                self._send(400, {"path": "$",
-                                 "message": "Content-Length 必须为整数"})
-                return
-            if length < 0:
-                self._send(400, {"path": "$", "message": "非法 Content-Length"})
-                return
-            body_text = self.rfile.read(length).decode("utf-8", "replace")
 
             try:
                 outcome = accept(body_text, store)
@@ -89,12 +83,47 @@ def make_handler(store: SettlementStore) -> type:
                 return
             self._send(200, outcome.receipt)
 
+        def _post_close(self) -> None:
+            body_text = self._read_body()
+            if body_text is None:
+                return
+            try:
+                outcome = accept_close(body_text, store)
+            except EnvelopeError as exc:
+                self._send(400, exc.to_dict())
+                return
+            self._send(200, outcome.receipt())
+
+        def _read_body(self) -> Any:
+            """读请求体；失败时已发送 400 并返回 ``None``。"""
+            length_raw = self.headers.get("Content-Length")
+            if length_raw is None:
+                self._send(400, {"path": "$",
+                                 "message": "缺少 Content-Length 请求头"})
+                return None
+            try:
+                length = int(length_raw)
+            except (TypeError, ValueError):
+                self._send(400, {"path": "$",
+                                 "message": "Content-Length 必须为整数"})
+                return None
+            if length < 0:
+                self._send(400, {"path": "$", "message": "非法 Content-Length"})
+                return None
+            return self.rfile.read(length).decode("utf-8", "replace")
+
     return SettlementHandler
+
+
+class SettlementHTTPServer(ThreadingHTTPServer):
+    """加大监听 backlog：默认 5 在多客户端并发下会丢连接。"""
+
+    request_queue_size = 128
 
 
 def serve(db_path: str, host: str, port: int) -> ThreadingHTTPServer:
     """创建并返回服务对象（调用方负责 ``serve_forever``/``shutdown``）。"""
     store = SettlementStore(db_path)
-    httpd = ThreadingHTTPServer((host, port), make_handler(store))
+    httpd = SettlementHTTPServer((host, port), make_handler(store))
     httpd.settlement_store = store  # type: ignore[attr-defined]
     return httpd

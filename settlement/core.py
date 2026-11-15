@@ -21,6 +21,11 @@
 按事实标识、终点标识双重对齐，取**新 B 减旧 B**；缺格作零；
 仅保留非零的 ``[事实id, 终点id, 整数差额]``，并按两个标识的 ASCII
 序（先事实后终点）排序；空批次保留为 ``[]``。
+
+结账信封
+--------
+``POST /close`` 仅收 ``{id}``：``id`` 沿用非空 ASCII 字母数字串规则，
+顶层仅允许该键；语法/重复键错误路径为 ``$``，其他问题报 ``$.id``。
 """
 
 import json
@@ -33,6 +38,7 @@ from energy_alloc.pipeline import process_text
 from .errors import EnvelopeError
 
 _ENVELOPE_KEYS = frozenset(("id", "base", "data"))
+_CLOSE_KEYS = frozenset(("id",))
 
 
 def _is_plain_int(value: Any) -> bool:
@@ -85,6 +91,30 @@ def parse_envelope(body_text: str) -> Dict[str, Any]:
         raise EnvelopeError("$.data", "data 必须为 JSON 对象")
 
     return {"id": req_id, "base": base, "data": data}
+
+
+def parse_close_envelope(body_text: str) -> Dict[str, Any]:
+    """解析结账体 ``{id}``，返回 ``{"id": id}``。
+
+    仅接受顶层成员 ``id``（非空 ASCII 字母数字串）；语法/重复键错误
+    路径 ``$``，未知成员报 ``$.<key>``，缺失报 ``$``。
+    """
+    try:
+        root = parse_json(body_text)
+    except AllocationError as exc:
+        raise EnvelopeError("$", exc.message) from None
+
+    if not isinstance(root, dict):
+        raise EnvelopeError("$", "结账体顶层必须为 JSON 对象")
+    for key in root:
+        if key not in _CLOSE_KEYS:
+            raise EnvelopeError(f"$.{key}", f"未知顶层成员: {key}")
+    if "id" not in root:
+        raise EnvelopeError("$", "缺少必需的顶层成员: id")
+    req_id = root["id"]
+    if not isinstance(req_id, str) or _ID_RE.match(req_id) is None:
+        raise EnvelopeError("$.id", "id 必须为非空 ASCII 字母数字串")
+    return {"id": req_id}
 
 
 def validate_frozen_data(data: Any) -> Dict[str, Any]:
@@ -172,3 +202,28 @@ def accept(body_text: str, store: "Any") -> AcceptOutcome:
                              replayed=True)
     return AcceptOutcome(version, result, {"v": version}, batch,
                          replayed=False)
+
+
+class CloseOutcome:
+    """结账受理结果：``{period, cut}`` 回执与原期间是否重放。"""
+
+    __slots__ = ("period", "cut", "replayed")
+
+    def __init__(self, period: int, cut: int, replayed: bool):
+        self.period = period
+        self.cut = cut
+        self.replayed = replayed
+
+    def receipt(self) -> Dict[str, int]:
+        return {"period": self.period, "cut": self.cut}
+
+
+def accept_close(body_text: str, store: "Any") -> CloseOutcome:
+    """受理一次结账：先校验，再在单事务内固定 cut、登记并换期。
+
+    同 ``id`` 重试回原回执（不改变原期间）；否则与提交串行等价地
+    取当前 ``v`` 为 ``cut``。结账不阻塞提交，也不影响版本号。
+    """
+    envelope = parse_close_envelope(body_text)
+    status, period, cut = store.commit_close(envelope["id"])
+    return CloseOutcome(period, cut, replayed=(status == "replayed"))

@@ -1,4 +1,4 @@
-"""投递进程：把结算库中待投版本按序投递到独立账本。
+"""投递进程：把结算库中待投版本按序投递到独立账本，随后投递结账。
 
 投递语义
 ========
@@ -12,12 +12,24 @@
 * 409 在按序投递下只可能来自账本库被外部破坏，记录告警后长退避，
   不跳过、不重复入账。
 
+结账投递（期间）
+----------------
+结算库中每次结账登记为 ``(period, cut)``。投递顺序被严格约束为：
+
+1. **先投完本期批次**：``p`` 必须达到该期 ``cut``，否则不投结账；
+2. 再向账本 ``POST /close`` 发送 ``{period, cut}``；
+3. 只有账本 200 确认后才投下一期（已确认标记落盘）。
+
+因此重启、丢确认只会让结账重投；账本对同期间同 cut 回原确认，
+不会串期、不会重复冻结。本期批次可能属于更早的期间（前一次结账
+尚未确认），按期间升序逐一确认，天然不会跳过。
+
 用法
 ====
 ``python3 -m settlement.delivery --settlement-db S.db --ledger-url URL
    [--once] [--interval 0.2] [--max-rounds N] [--max-attempts N]``
 
-``--once``/``--max-rounds`` 便于测试：追平（无待投）即退出。
+``--once``/``--max-rounds`` 便于测试：追平（无待投批次与结账）即退出。
 """
 
 import argparse
@@ -41,31 +53,50 @@ class LedgerUnavailable(RuntimeError):
     """账本持续不可达（仅在有界模式达上限时抛出）。"""
 
 
-def post_batch(ledger_url: str, version: int, batch: list,
+def _post_json(url: str, payload: Dict[str, Any],
                timeout: float = 10.0) -> Tuple[int, Dict[str, Any]]:
-    """向账本投递一版，返回 ``(HTTP 状态, 响应字典)``。
+    """向账本 POST 一份 JSON，返回 ``(HTTP 状态, 响应字典)``。
 
     连接类异常以 ``(0, {})`` 形式返回交由重试循环处理；
     HTTP 4xx/5xx 正常返回状态码与解析后的响应体。
     """
-    body = json.dumps({"v": version, "d": batch},
-                      ensure_ascii=False).encode("utf-8")
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
-        ledger_url, data=body, method="POST",
+        url, data=body, method="POST",
         headers={"Content-Type": "application/json; charset=utf-8"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
-            return resp.status, payload
+            return resp.status, json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         try:
-            payload = json.loads(exc.read().decode("utf-8"))
+            payload_out = json.loads(exc.read().decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
-            payload = {}
-        return exc.code, payload
+            payload_out = {}
+        return exc.code, payload_out
     except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
         _LOG.debug("账本连接失败：%s", exc)
         return 0, {}
+
+
+def post_batch(ledger_url: str, version: int, batch: list,
+               timeout: float = 10.0) -> Tuple[int, Dict[str, Any]]:
+    """向账本投递一版（``POST /ledger``），返回 ``(HTTP 状态, 响应)``。"""
+    return _post_json(ledger_url, {"v": version, "d": batch}, timeout)
+
+
+def close_url_from_ledger_url(ledger_url: str) -> str:
+    """由 ``.../ledger`` 推导同源账本的 ``.../close`` 地址。"""
+    base = ledger_url.rstrip("/")
+    if base.endswith("/ledger"):
+        return base[:-len("/ledger")] + "/close"
+    return base + "/close"
+
+
+def post_close(ledger_url: str, period: int, cut: int,
+               timeout: float = 10.0) -> Tuple[int, Dict[str, Any]]:
+    """向账本投递一次结账（``POST /close``），返回 ``(HTTP 状态, 响应)``。"""
+    return _post_json(close_url_from_ledger_url(ledger_url),
+                      {"period": period, "cut": cut}, timeout)
 
 
 class DeliveryWorker:
@@ -89,18 +120,32 @@ class DeliveryWorker:
         self._backoff = min(self._backoff * 2, self._backoff_max)
 
     def deliver_one(self) -> Optional[bool]:
-        """尝试投递一个待投版本。
+        """尝试投递一个待投版本；批次追平后转而投递下一切账。
 
         返回值：
-          * ``True``：有版本被账本确认（水位可能推进）；
-          * ``False``：已全部确认（v == p，真正追平）；
-          * ``None``：下一版被其他投递者持有有效租约，本轮无可认领。
+          * ``True``：有版本或结账被账本确认；
+          * ``False``：批次与结账均已确认（真正追平）；
+          * ``None``：下一版/下一切账被其他投递者持有有效租约。
 
         网络/5xx 故障在本方法内退避重试（守护语义：通信恢复后
         自动追平）；有界模式由 ``_max_attempts`` 限制总尝试数。
         """
         v, p, _r = self.store.current_state()
+        pending_close = self.store.next_pending_close()
+        if pending_close is not None and p >= pending_close[1]:
+            # 本期（含此前各期）批次已全部投完：先投结账，再进入下一期。
+            # 本期 cut 之前的版本都已入账，账本当前 v 恰为 cut；
+            # 晚到的、属于后续期间的版本在此处被有意挡在结账之后。
+            claimed_close = self.store.claim_close(
+                pending_close[0], lease_seconds=self._lease_seconds)
+            if claimed_close is None:
+                return None
+            self._deliver_close(*claimed_close)
+            self._backoff = self._backoff_min
+            return True
+
         if p >= v:
+            # 批次已追平且无待投结账：真正空闲
             self._backoff = self._backoff_min
             return False
 
@@ -138,6 +183,36 @@ class DeliveryWorker:
                           version, status)
             self._sleep_backoff()
 
+    def _deliver_close(self, period: int, cut: int) -> None:
+        """投递一次结账；确认后持久标记并释放租约。
+
+        200 回 ``{period, cut}`` 表示受理：同期间同 cut 的重放也回 200，
+        因此丢确认后的重试幂等。409 与批次投递一样长退避重试，绝不
+        跳过（跳过会串期）。
+        """
+        while True:
+            self._attempts += 1
+            if (self._max_attempts is not None
+                    and self._attempts > self._max_attempts):
+                raise LedgerUnavailable(
+                    f"达到最大投递尝试次数 {self._max_attempts}")
+            status, payload = post_close(self.ledger_url, period, cut)
+            if status == 200:
+                self.store.confirm_close(period)
+                _LOG.info("期间 %s（cut=%s）结账已确认", period, cut)
+                return
+            if status == 409:
+                # 按序投递下不应出现；不跳过，长退避后由账本澄清
+                _LOG.warning("期间 %s 结账收到 409：%s；退避后重试",
+                             period, payload)
+            elif status == 400:
+                raise DeliveryContractError(
+                    f"账本拒绝期间 {period} 结账：{payload}")
+            else:
+                _LOG.info("期间 %s 结账暂不成功（status=%s），退避重试",
+                          period, status)
+            self._sleep_backoff()
+
     def run_forever(self, interval: float = 0.2) -> None:
         """守护循环：追平后周期性醒来继续投递。"""
         while True:
@@ -154,7 +229,7 @@ class DeliveryWorker:
         因此多个投递进程并发时，空闲退出的进程不会留下未投版本。
         ``max_attempts`` 限制网络投递的总尝试次数（含重试），超出抛
         :class:`LedgerUnavailable`，供"账本不可达"场景有界退出。
-        返回累计确认的版本数。
+        返回累计确认的批次数与结账数。
         """
         self._max_attempts = max_attempts
         self._attempts = 0

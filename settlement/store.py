@@ -7,6 +7,15 @@
 ``submissions`` 受理幂等表：信封 id → 版本、规范化 data、原结果、回执。
 ``batches``     版本账：每版的待投批次 ``d`` 与投递确认标记。
 ``inflight``    在途租约：多进程投递时同一版本的排他认领。
+``closes``      结账登记：期间号 → 结账 id、cut（结账时的 ``v``）、投递标记。
+``close_inflight`` 结账投递的在途租约。
+
+期间（period）与结账（close）
+============================
+期间从 1 递增。结账在受理事务串行语义下把当前 ``v`` 固定为 ``cut``，
+登记后开启下一期间；期间内版本区间为 ``(上一 cut, cut]``。允许连续
+多次结账（空期间、相同 cut）。结账不阻塞提交；同结账 id 重试回原
+回执、不改变原期间。
 
 并发与崩溃
 ==========
@@ -50,6 +59,17 @@ CREATE TABLE IF NOT EXISTS batches (
 );
 CREATE TABLE IF NOT EXISTS inflight (
     version    INTEGER PRIMARY KEY,
+    leased_at  REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS closes (
+    close_id      TEXT PRIMARY KEY,
+    period        INTEGER NOT NULL UNIQUE,
+    cut           INTEGER NOT NULL,
+    delivered     INTEGER NOT NULL DEFAULT 0,
+    receipt_json  TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS close_inflight (
+    period     INTEGER PRIMARY KEY,
     leased_at  REAL NOT NULL
 );
 """
@@ -118,6 +138,120 @@ class SettlementStore:
         finally:
             conn.close()
         return None if row is None else json.loads(row[0])
+
+    # ------------------------------------------------------------------
+    # 结账（与受理同库串行：cut 固定为事务内看到的 v）
+    # ------------------------------------------------------------------
+    def commit_close(self, close_id: str) -> Tuple[str, int, int]:
+        """在单个立即事务内登记一次结账。
+
+        返回 ``(status, period, cut)``：``status`` 为 ``"replayed"``（同
+        id 回原回执，不换期）或 ``"accepted"``（新登记，期间 = 已有最大
+        期间 + 1，cut = 事务内当前 ``v``）。期间从 1 递增，允许空期间与
+        相同 cut。
+        """
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT period, cut FROM closes WHERE close_id=?",
+                (close_id,)).fetchone()
+            if row is not None:
+                conn.execute("COMMIT")
+                return "replayed", int(row[0]), int(row[1])
+
+            v = int(conn.execute(
+                "SELECT v FROM meta WHERE id=1").fetchone()[0])
+            last = conn.execute(
+                "SELECT MAX(period) FROM closes").fetchone()[0]
+            period = (int(last) if last is not None else 0) + 1
+            receipt_json = canonical_json({"period": period, "cut": v})
+            conn.execute(
+                "INSERT INTO closes (close_id, period, cut, delivered, "
+                "receipt_json) VALUES (?, ?, ?, 0, ?)",
+                (close_id, period, v, receipt_json))
+            conn.execute("COMMIT")
+            return "accepted", period, v
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------------------
+    # 结账投递（先投完本期批次，再投结账，最后才进入下一期）
+    # ------------------------------------------------------------------
+    def next_pending_close(self) -> Optional[Tuple[int, int]]:
+        """最低的未确认结账 ``(period, cut)``；无则 ``None``。"""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT period, cut FROM closes WHERE delivered=0 "
+                "ORDER BY period LIMIT 1").fetchone()
+        finally:
+            conn.close()
+        return None if row is None else (int(row[0]), int(row[1]))
+
+    def claim_close(self, period: int, lease_seconds: float = 30.0
+                    ) -> Optional[Tuple[int, int]]:
+        """认领一次结账投递；本期批次尚未全部确认时返回 ``None``。
+
+        租约保证多进程不重复认领；确认状态不改，租约到期可重新认领。
+        """
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT cut, delivered FROM closes WHERE period=?",
+                (period,)).fetchone()
+            if row is None or row[1] != 0:
+                conn.execute("COMMIT")
+                return None
+            cut = int(row[0])
+            _v, p, _r = conn.execute(
+                "SELECT v, p, r FROM meta WHERE id=1").fetchone()
+            if p < cut:
+                # 本期仍有未确认批次，必须先投完批次
+                conn.execute("COMMIT")
+                return None
+            now = time.monotonic()
+            lease = conn.execute(
+                "SELECT leased_at FROM close_inflight WHERE period=?",
+                (period,)).fetchone()
+            if lease is not None and now - lease[0] < lease_seconds:
+                conn.execute("COMMIT")
+                return None
+            if lease is None:
+                conn.execute(
+                    "INSERT INTO close_inflight (period, leased_at) "
+                    "VALUES (?, ?)", (period, now))
+            else:
+                conn.execute(
+                    "UPDATE close_inflight SET leased_at=? WHERE period=?",
+                    (now, period))
+            conn.execute("COMMIT")
+            return period, cut
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+
+    def confirm_close(self, period: int) -> None:
+        """账本确认后持久标记该期已结账并释放租约（幂等）。"""
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "UPDATE closes SET delivered=1 WHERE period=?", (period,))
+            conn.execute(
+                "DELETE FROM close_inflight WHERE period=?", (period,))
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
 
     # ------------------------------------------------------------------
     # 受理（单事务串行化）
@@ -198,6 +332,14 @@ class SettlementStore:
                 conn.execute("COMMIT")
                 return None
             target = p + 1
+            # 期间栅栏：存在未确认结账时，绝不越过其 cut 投递后续版本。
+            # 与结账登记同库事务串行，保证"先投完本期批次、确认结账、
+            # 再投下一期"严格成立，晚到版本不会串到已结账期间之前。
+            pending_cut = conn.execute(
+                "SELECT MIN(cut) FROM closes WHERE delivered=0").fetchone()[0]
+            if pending_cut is not None and target > int(pending_cut):
+                conn.execute("COMMIT")
+                return None
             now = time.monotonic()
             row = conn.execute(
                 "SELECT leased_at FROM inflight WHERE version=?",
